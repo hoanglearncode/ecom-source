@@ -1,0 +1,275 @@
+# Development Docker Compose for E-commerce Microservices
+# Usage: docker-compose -f docker-compose.dev.yml up
+
+version: "3.8"
+
+services:
+  # Shared Infrastructure
+  postgres:
+    image: postgres:17-alpine
+    container_name: ecommerce-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_MULTIPLE_DATABASES: auth_db,product_db,order_db,inventory_db,payment_db
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sh:/docker-entrypoint-initdb.d/init-db.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ecommerce-network
+
+  redis:
+    image: redis:8-alpine
+    container_name: ecommerce-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ecommerce-network
+
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    container_name: ecommerce-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS:-guest}
+    ports:
+      - "${RABBITMQ_MGMT_PORT:-15672}:15672"  # Management UI
+      - "${RABBITMQ_PORT:-5672}:5672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - ecommerce-network
+
+  # API Gateway
+  api-gateway:
+    build:
+      context: ./api-gateway
+      dockerfile: Dockerfile.dev
+    container_name: api-gateway
+    restart: unless-stopped
+    ports:
+      - "${GATEWAY_PORT:-8080}:8080"
+      - "${DEBUG_PORT:-5005}:5005"  # Debug port for Spring Boot
+    environment:
+      SPRING_PROFILES_ACTIVE: dev
+      SPRING_R2DBC_URL: r2dbc:postgresql://postgres:5432/gateway_db
+      SPRING_R2DBC_USERNAME: ${POSTGRES_USER:-postgres}
+      SPRING_R2DBC_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_PASS: ${RABBITMQ_PASS:-guest}
+      AUTH_SERVICE_URL: http://auth-service:3000
+      PRODUCT_SERVICE_URL: http://product-service:3000
+      ORDER_SERVICE_URL: http://order-service:3000
+    volumes:
+      - ./api-gateway/src:/app/src:cached
+      - ./api-gateway/pom.xml:/app/pom.xml:cached
+      - maven_cache:/root/.m2
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Auth Service
+  auth-service:
+    build:
+      context: ./auth
+      dockerfile: Dockerfile.dev
+    container_name: auth-service
+    restart: unless-stopped
+    ports:
+      - "${AUTH_PORT:-3001}:3000"
+    environment:
+      NODE_ENV: development
+      PORT: 3000
+      MONGODB_URI: mongodb://${MONGODB_HOST:-mongodb}:27017/auth_db
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+    volumes:
+      - ./auth/src:/app/src:cached
+      - ./auth/package.json:/app/package.json:cached
+      - /app/node_modules  # Prevent overwriting node_modules
+    depends_on:
+      - redis
+      - rabbitmq
+    networks:
+      - ecommerce-network
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Product Service (placeholder - to be implemented)
+  # product-service:
+  #   build:
+  #     context: ./product-service
+  #     dockerfile: Dockerfile.dev
+  #   container_name: product-service
+  #   restart: unless-stopped
+  #   ports:
+  #     - "${PRODUCT_PORT:-3002}:3000"
+  #   environment:
+  #     NODE_ENV: development
+  #     DATABASE_URL: postgresql://postgres:postgres@postgres:5432/product_db
+  #     REDIS_HOST: redis
+  #     REDIS_PORT: 6379
+  #     RABBITMQ_HOST: rabbitmq
+  #     RABBITMQ_PORT: 5672
+  #   volumes:
+  #     - ./product-service/src:/app/src:cached
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #   networks:
+  #     - ecommerce-network
+
+  # Order Service (placeholder - to be implemented)
+  # order-service:
+  #   build:
+  #     context: ./order-service
+  #     dockerfile: Dockerfile.dev
+  #   container_name: order-service
+  #   restart: unless-stopped
+  #   ports:
+  #     - "${ORDER_PORT:-3003}:3000"
+  #   environment:
+  #     NODE_ENV: development
+  #     DATABASE_URL: postgresql://postgres:postgres@postgres:5432/order_db
+  #     REDIS_HOST: redis
+  #     REDIS_PORT: 6379
+  #     RABBITMQ_HOST: rabbitmq
+  #     RABBITMQ_PORT: 5672
+  #   volumes:
+  #     - ./order-service/src:/app/src:cached
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #   networks:
+  #     - ecommerce-network
+
+  # Payment Service (placeholder - to be implemented)
+  # payment-service:
+  #   build:
+  #     context: ./payment-service
+  #     dockerfile: Dockerfile.dev
+  #   container_name: payment-service
+  #   restart: unless-stopped
+  #   ports:
+  #     - "${PAYMENT_PORT:-3004}:3000"
+  #   environment:
+  #     NODE_ENV: development
+  #     DATABASE_URL: postgresql://postgres:postgres@postgres:5432/payment_db
+  #     REDIS_HOST: redis
+  #     REDIS_PORT: 6379
+  #     RABBITMQ_HOST: rabbitmq
+  #     RABBITMQ_PORT: 5672
+  #   volumes:
+  #     - ./payment-service/src:/app/src:cached
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #   networks:
+  #     - ecommerce-network
+
+  # Inventory Service (placeholder - to be implemented)
+  # inventory-service:
+  #   build:
+  #     context: ./inventory-service
+  #     dockerfile: Dockerfile.dev
+  #   container_name: inventory-service
+  #   restart: unless-stopped
+  #   ports:
+  #     - "${INVENTORY_PORT:-3005}:3000"
+  #   environment:
+  #     NODE_ENV: development
+  #     DATABASE_URL: postgresql://postgres:postgres@postgres:5432/inventory_db
+  #     REDIS_HOST: redis
+  #     REDIS_PORT: 6379
+  #     RABBITMQ_HOST: rabbitmq
+  #     RABBITMQ_PORT: 5672
+  #   volumes:
+  #     - ./inventory-service/src:/app/src:cached
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #   networks:
+  #     - ecommerce-network
+
+  # Notification Service (placeholder - to be implemented)
+  # notification-service:
+  #   build:
+  #     context: ./notification-service
+  #     dockerfile: Dockerfile.dev
+  #   container_name: notification-service
+  #   restart: unless-stopped
+  #   ports:
+  #     - "${NOTIFICATION_PORT:-3006}:3000"
+  #   environment:
+  #     NODE_ENV: development
+  #     REDIS_HOST: redis
+  #     REDIS_PORT: 6379
+  #     RABBITMQ_HOST: rabbitmq
+  #     RABBITMQ_PORT: 5672
+  #     SMTP_HOST: ${SMTP_HOST}
+  #     SMTP_PORT: ${SMTP_PORT:-587}
+  #   volumes:
+  #     - ./notification-service/src:/app/src:cached
+  #   depends_on:
+  #     - redis
+  #     - rabbitmq
+  #   networks:
+  #     - ecommerce-network
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  rabbitmq_data:
+    driver: local
+  maven_cache:
+    driver: local
+
+networks:
+  ecommerce-network:
+    driver: bridge

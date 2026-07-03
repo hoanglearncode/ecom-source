@@ -76,31 +76,32 @@ npm start
 
 ### Public Routes
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/api/auth/register` | Đăng ký user mới |
-| POST | `/api/auth/login` | Đăng nhập |
-| POST | `/api/auth/refresh` | Làm mới access token |
+| Method | Endpoint             | Description          |
+| ------ | -------------------- | -------------------- |
+| POST   | `/api/auth/register` | Đăng ký user mới     |
+| POST   | `/api/auth/login`    | Đăng nhập            |
+| POST   | `/api/auth/refresh`  | Làm mới access token |
 
 ### Protected Routes (cần Access Token)
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/api/auth/logout` | Đăng xuất (thiết bị hiện tại) |
-| POST | `/api/auth/logout-all` | Đăng xuất tất cả thiết bị |
-| GET | `/api/auth/me` | Lấy thông tin user hiện tại |
+| Method | Endpoint               | Description                   |
+| ------ | ---------------------- | ----------------------------- |
+| POST   | `/api/auth/logout`     | Đăng xuất (thiết bị hiện tại) |
+| POST   | `/api/auth/logout-all` | Đăng xuất tất cả thiết bị     |
+| GET    | `/api/auth/me`         | Lấy thông tin user hiện tại   |
 
 ### Other Routes
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/health` | Health check |
-| GET | `/api/protected` | Ví dụ route bảo vệ |
-| GET | `/api/admin` | Ví dụ route admin-only |
+| Method | Endpoint         | Description            |
+| ------ | ---------------- | ---------------------- |
+| GET    | `/health`        | Health check           |
+| GET    | `/api/protected` | Ví dụ route bảo vệ     |
+| GET    | `/api/admin`     | Ví dụ route admin-only |
 
 ## 🔐 Authentication Flow
 
 ### 1. Đăng ký
+
 ```bash
 POST /api/auth/register
 {
@@ -123,6 +124,7 @@ Response:
 ```
 
 ### 2. Đăng nhập
+
 ```bash
 POST /api/auth/login
 {
@@ -133,12 +135,14 @@ POST /api/auth/login
 ```
 
 ### 3. Sử dụng Access Token
+
 ```bash
 GET /api/protected
 Authorization: Bearer <accessToken>
 ```
 
 ### 4. Làm mới Token
+
 ```bash
 POST /api/auth/refresh
 {
@@ -155,6 +159,7 @@ Response:
 ```
 
 ### 5. Đăng xuất
+
 ```bash
 POST /api/auth/logout
 Authorization: Bearer <accessToken>

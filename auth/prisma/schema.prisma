@@ -1,0 +1,421 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ============================================================
+// ENUMS
+// ============================================================
+
+enum ROLE {
+  USER
+  ADMIN
+  STAFF
+  INVESTOR
+}
+
+enum STATUS {
+  ACTIVE
+  BANNED
+  DELETED
+  UNVERIFIED
+}
+
+enum VERIFY_TYPE {
+  EMAIL_REGISTER       // Xác thực email khi đăng ký
+  EMAIL_CHANGE         // Xác thực email mới khi đổi email
+  PHONE_REGISTER       // Xác thực số điện thoại
+  PHONE_CHANGE         // Xác thực SĐT mới khi đổi SĐT
+  PASSWORD_RESET       // Reset mật khẩu
+  TWO_FACTOR_ENABLE    // Bật 2FA
+  DEVICE_TRUST         // Xác nhận thiết bị lạ
+}
+
+enum TWOFA_TYPE {
+  TOTP       // Google Authenticator / Authy
+  SMS_OTP    // OTP qua SMS
+  EMAIL_OTP  // OTP qua Email
+  BACKUP     // Backup code
+}
+
+enum BLACKLIST_REASON {
+  LOGOUT               // Người dùng tự đăng xuất
+  PASSWORD_CHANGED     // Đổi mật khẩu → thu hồi tất cả token
+  ACCOUNT_BANNED       // Tài khoản bị khóa
+  SECURITY_BREACH      // Phát hiện bất thường
+  ADMIN_REVOKE         // Admin thu hồi thủ công
+  TOKEN_REFRESH        // Token cũ sau khi refresh
+}
+
+enum OAUTH_PROVIDER {
+  GOOGLE
+  FACEBOOK
+  GITHUB
+  APPLE
+  ZALO
+}
+
+// ============================================================
+// CORE USER
+// ============================================================
+
+/// Bảng người dùng trung tâm — chỉ lưu thông tin auth/identity
+model User {
+  id            String    @id @default(uuid()) @db.Uuid
+  username      String    @unique @db.VarChar(50)
+  email         String?   @unique @db.VarChar(255)
+  phone         String?   @unique @db.VarChar(20)
+  passwordHash  String    @db.VarChar(255) @map("password_hash")
+  role          ROLE      @default(USER)
+  status        STATUS    @default(UNVERIFIED)
+
+  // Bảo mật thêm
+  failedLoginCount  Int       @default(0) @map("failed_login_count")
+  lockedUntil       DateTime? @map("locked_until")
+  lastLoginAt       DateTime? @map("last_login_at")
+  lastLoginIp       String?   @db.VarChar(45) @map("last_login_ip")
+  passwordChangedAt DateTime? @map("password_changed_at")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at") // Soft delete
+
+  // Relations
+  profile         UserProfile?
+  verifications   UserVerify[]
+  tokens          Token[]
+  blacklistedTokens BlackListToken[]
+  twoFactor       TwoFactor?
+  oauthAccounts   OAuthAccount[]
+  passwordHistory PasswordHistory[]
+  auditLogs       AuditLog[]
+  loginAttempts   LoginAttempt[]
+  apiKeys         ApiKey[]
+
+  @@index([email])
+  @@index([phone])
+  @@index([status])
+  @@index([role])
+  @@index([deletedAt])
+  @@map("users")
+}
+
+/// Thông tin profile mở rộng — tách riêng để giữ bảng User nhỏ gọn
+model UserProfile {
+  id        String  @id @default(uuid()) @db.Uuid
+  userId    String  @unique @db.Uuid @map("user_id")
+  fullName  String? @db.VarChar(100) @map("full_name")
+  avatarUrl String? @db.Text @map("avatar_url")
+  timezone  String? @db.VarChar(50) @default("UTC")
+  locale    String? @db.VarChar(10) @default("vi")
+  metadata  Json?   @default("{}") // Dữ liệu mở rộng tùy service
+
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_profiles")
+}
+
+// ============================================================
+// VERIFICATION & OTP
+// ============================================================
+
+/// Quản lý tất cả luồng xác thực: email, phone, reset password...
+model UserVerify {
+  id      String      @id @default(uuid()) @db.Uuid
+  userId  String      @db.Uuid @map("user_id")
+  type    VERIFY_TYPE
+
+  // Token dạng link (email confirm)
+  token   String?     @unique @db.VarChar(512)
+
+  // OTP dạng số (SMS/Email OTP)
+  otpHash String?     @db.VarChar(255) @map("otp_hash") // Luôn hash OTP, không lưu plaintext
+
+  attempts  Int     @default(0)            // Số lần nhập sai
+  isUsed    Boolean @default(false) @map("is_used")
+
+  expiresAt DateTime  @map("expires_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+  usedAt    DateTime? @map("used_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([token])
+  @@index([userId, type, isUsed])
+  @@index([expiresAt]) // Dùng cho job xóa record hết hạn
+  @@map("user_verifications")
+}
+
+// ============================================================
+// TOKEN MANAGEMENT
+// ============================================================
+
+/// Access token + Refresh token theo từng thiết bị
+model Token {
+  id           String  @id @default(uuid()) @db.Uuid
+  userId       String  @db.Uuid @map("user_id")
+
+  // JWT ID để có thể blacklist chính xác (jti claim)
+  accessJti    String  @unique @db.VarChar(36) @map("access_jti")
+  refreshToken String  @unique @db.VarChar(512) @map("refresh_token") // Hashed
+
+  // Thiết bị
+  deviceId     String? @db.VarChar(255) @map("device_id")
+  deviceName   String? @db.VarChar(255) @map("device_name") // "iPhone 15 Pro"
+  deviceType   String? @db.VarChar(50)  @map("device_type") // "mobile", "desktop", "api"
+
+  // Bảo mật
+  ipAddress    String? @db.VarChar(45)  @map("ip_address")
+  userAgent    String? @db.Text         @map("user_agent")
+
+  isRevoked    Boolean   @default(false) @map("is_revoked")
+  accessExpiresAt  DateTime @map("access_expires_at")
+  refreshExpiresAt DateTime @map("refresh_expires_at")
+  lastUsedAt   DateTime?  @map("last_used_at")
+  createdAt    DateTime   @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, isRevoked])
+  @@index([refreshToken])
+  @@index([deviceId])
+  @@index([refreshExpiresAt]) // Dùng cho job cleanup
+  @@map("tokens")
+}
+
+/// Danh sách đen JWT — phục vụ stateless auth với khả năng thu hồi
+model BlackListToken {
+  id        String           @id @default(uuid()) @db.Uuid
+  jti       String           @unique @db.VarChar(36)  // JWT ID từ claim
+  userId    String           @db.Uuid @map("user_id")
+  reason    BLACKLIST_REASON
+  ipAddress String?          @db.VarChar(45) @map("ip_address")
+  expiresAt DateTime         @map("expires_at") // Sau thời điểm này có thể xóa
+  createdAt DateTime         @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([jti])            // Lookup nhanh khi validate token
+  @@index([expiresAt])      // Dùng cho job cleanup
+  @@index([userId])
+  @@map("blacklist_tokens")
+}
+
+// ============================================================
+// TWO-FACTOR AUTHENTICATION
+// ============================================================
+
+/// Cấu hình 2FA cho từng người dùng
+model TwoFactor {
+  id          String     @id @default(uuid()) @db.Uuid
+  userId      String     @unique @db.Uuid @map("user_id")
+  type        TWOFA_TYPE @default(TOTP)
+
+  // TOTP secret (encrypted at application level)
+  secret      String?    @db.VarChar(512)
+
+  // Backup codes: lưu dưới dạng array hash đã bcrypt
+  backupCodes String[]   @map("backup_codes") @db.Text
+
+  isEnabled   Boolean    @default(false) @map("is_enabled")
+  isVerified  Boolean    @default(false) @map("is_verified") // Đã xác nhận setup thành công
+
+  enabledAt   DateTime?  @map("enabled_at")
+  createdAt   DateTime   @default(now()) @map("created_at")
+  updatedAt   DateTime   @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("two_factors")
+}
+
+// ============================================================
+// OAUTH / SOCIAL LOGIN
+// ============================================================
+
+/// Liên kết tài khoản mạng xã hội
+model OAuthAccount {
+  id           String        @id @default(uuid()) @db.Uuid
+  userId       String        @db.Uuid @map("user_id")
+  provider     OAUTH_PROVIDER
+  providerId   String        @db.VarChar(255) @map("provider_id") // ID từ provider
+
+  accessToken  String?       @db.Text @map("access_token")  // Encrypted
+  refreshToken String?       @db.Text @map("refresh_token") // Encrypted
+  rawData      Json?         @map("raw_data") // Toàn bộ response từ provider
+
+  tokenExpiresAt DateTime?   @map("token_expires_at")
+  createdAt      DateTime    @default(now()) @map("created_at")
+  updatedAt      DateTime    @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerId]) // Mỗi account provider chỉ link một user
+  @@index([userId])
+  @@map("oauth_accounts")
+}
+
+// ============================================================
+// PASSWORD SECURITY
+// ============================================================
+
+/// Lịch sử mật khẩu — ngăn dùng lại mật khẩu cũ
+model PasswordHistory {
+  id           String   @id @default(uuid()) @db.Uuid
+  userId       String   @db.Uuid @map("user_id")
+  passwordHash String   @db.VarChar(255) @map("password_hash")
+  ipAddress    String?  @db.VarChar(45)  @map("ip_address")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@map("password_histories")
+}
+
+// ============================================================
+// AUDIT & MONITORING
+// ============================================================
+
+/// Nhật ký toàn bộ hành động bảo mật quan trọng
+model AuditLog {
+  id          String  @id @default(uuid()) @db.Uuid
+  userId      String? @db.Uuid @map("user_id") // Nullable: hành động chưa auth
+
+  action      String  @db.VarChar(100)  // "user.login", "password.reset", "2fa.enable"
+  resource    String? @db.VarChar(100)  // "user", "token", "api_key"
+  resourceId  String? @db.VarChar(255) @map("resource_id")
+
+  // Context
+  ipAddress   String? @db.VarChar(45) @map("ip_address")
+  userAgent   String? @db.Text        @map("user_agent")
+
+  // Data snapshot (để forensics)
+  oldValue    Json?   @map("old_value")
+  newValue    Json?   @map("new_value")
+  metadata    Json?   @default("{}")
+
+  isSuccess     Boolean @default(true) @map("is_success")
+  failureReason String? @db.VarChar(500) @map("failure_reason")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId, action])
+  @@index([action, createdAt])
+  @@index([createdAt])          // Partitioning key nếu dùng pg_partman
+  @@index([ipAddress])
+  @@map("audit_logs")
+}
+
+/// Theo dõi các lần đăng nhập thất bại — phục vụ rate limiting & brute-force detection
+model LoginAttempt {
+  id            String   @id @default(uuid()) @db.Uuid
+  userId        String?  @db.Uuid @map("user_id") // Nullable: nếu không tìm thấy user
+  emailOrPhone  String?  @db.VarChar(255) @map("email_or_phone")
+  ipAddress     String   @db.VarChar(45)  @map("ip_address")
+  deviceId      String?  @db.VarChar(255) @map("device_id")
+
+  isSuccess     Boolean  @default(false) @map("is_success")
+  failureReason String?  @db.VarChar(255) @map("failure_reason") // "wrong_password", "account_locked"...
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([ipAddress, createdAt])   // Detect brute-force theo IP
+  @@index([userId, createdAt])      // Detect brute-force theo account
+  @@index([emailOrPhone, createdAt])
+  @@index([createdAt])
+  @@map("login_attempts")
+}
+
+/// Danh sách IP bị block — có thể tạm thời hoặc vĩnh viễn
+model IpBlock {
+  id           String   @id @default(uuid()) @db.Uuid
+  ipAddress    String   @unique @db.VarChar(45) @map("ip_address")
+  reason       String   @db.VarChar(255)
+  attemptCount Int      @default(0) @map("attempt_count")
+  isPermanent  Boolean  @default(false) @map("is_permanent")
+  blockedUntil DateTime? @map("blocked_until") // Null nếu isPermanent = true
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  @@index([ipAddress, blockedUntil])
+  @@map("ip_blocks")
+}
+
+// ============================================================
+// RBAC — ROLE-BASED ACCESS CONTROL
+// ============================================================
+
+/// Danh mục quyền (resource + action)
+model Permission {
+  id          String  @id @default(uuid()) @db.Uuid
+  name        String  @unique @db.VarChar(100) // "user:read", "order:delete"
+  resource    String  @db.VarChar(50)           // "user", "order", "product"
+  action      String  @db.VarChar(50)           // "create", "read", "update", "delete"
+  description String? @db.VarChar(255)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  rolePermissions RolePermission[]
+
+  @@unique([resource, action])
+  @@map("permissions")
+}
+
+/// Gán quyền cho từng ROLE
+model RolePermission {
+  id           String  @id @default(uuid()) @db.Uuid
+  role         ROLE
+  permissionId String  @db.Uuid @map("permission_id")
+  grantedAt    DateTime @default(now()) @map("granted_at")
+
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@unique([role, permissionId])
+  @@map("role_permissions")
+}
+
+// ============================================================
+// API KEY MANAGEMENT
+// ============================================================
+
+/// API Key cho server-to-server hoặc developer API access
+model ApiKey {
+  id          String   @id @default(uuid()) @db.Uuid
+  userId      String   @db.Uuid @map("user_id")
+  name        String   @db.VarChar(100)      // "Production Server", "CI/CD Pipeline"
+  keyHash     String   @unique @db.VarChar(255) @map("key_hash")  // bcrypt/sha256 của key
+  keyPrefix   String   @db.VarChar(10) @map("key_prefix") // 8 ký tự đầu để display: "sk_abc123..."
+
+  scopes      Json     @default("[]")        // ["user:read", "order:write"]
+  ipWhitelist String[] @map("ip_whitelist")  // Danh sách IP được phép
+  rateLimit   Int?     @map("rate_limit")    // requests/phút, null = dùng default
+
+  isActive    Boolean   @default(true) @map("is_active")
+  expiresAt   DateTime? @map("expires_at")   // Null = không hết hạn
+  lastUsedAt  DateTime? @map("last_used_at")
+
+  createdAt   DateTime  @default(now()) @map("created_at")
+  revokedAt   DateTime? @map("revoked_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([keyHash])
+  @@index([userId, isActive])
+  @@map("api_keys")
+}

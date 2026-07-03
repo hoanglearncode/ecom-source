@@ -1,102 +1,167 @@
-import express, { Request, Response, NextFunction } from 'express';
-import cors from 'cors';
-import cookieParser from 'cookie-parser';
-import dotenv from 'dotenv';
-import { closeRedisConnection } from './utils/tokenBlacklist.js';
-import { UserModel } from './models/user.js';
-import authRouter from './routes/auth.js';
-import { authenticate, optionalAuth } from './middleware/auth.js';
+/**
+ * Auth Service Entry Point
+ * Hexagonal Architecture Implementation
+ *
+ * This file initializes and starts the Auth Service following hexagonal architecture:
+ * - Domain Layer (Core): Entities, Value Objects, Repository Interfaces (Ports)
+ * - Application Layer: Use Cases, DTOs, Error Handling
+ * - Infrastructure Layer: Repository Implementations (Adapters), External Services
+ * - Presentation Layer: Controllers, Routes, Middleware
+ *
+ * Flow:
+ * 1. Initialize DI Container with all dependencies
+ * 2. Setup Express app with middleware
+ * 3. Mount routes from controllers
+ * 4. Start server
+ */
 
-// Load environment variables
-dotenv.config();
+import express from 'express';
+import { diContainer } from '@/di/container.js';
+import { authConfig } from '@/config/index.js';
+import { logger } from '@/shared/logger/index.js';
+import { buildRoutes } from '@/presentation/http/routes.js';
+import { errorHandler } from '@/presentation/http/middleware/error-handler.middleware.js';
 
-const app = express();
-const PORT = process.env.PORT || 3000;
+// ============================================================
+// Express App Setup
+// ============================================================
 
+const app: express.Application = express();
+
+const PORT = authConfig.PORT || 8081;
+const version = authConfig.version || '1.0.0';
+const environment = authConfig.NODE_ENV || 'development';
+
+// ============================================================
 // Middleware
-app.use(cors({
-  origin: process.env.CORS_ORIGIN || '*',
-  credentials: true
-}));
+// ============================================================
+
+// Parse JSON bodies
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.use(cookieParser());
 
-// Health check
-app.get('/health', (_req: Request, res: Response) => {
-  res.json({
-    status: 'ok',
-    timestamp: new Date().toISOString(),
-    service: 'auth-service'
-  });
-});
-
-// API Routes
-app.use('/api/auth', authRouter);
-
-// Protected route example
-app.get('/api/protected', authenticate, (_req: Request, res: Response) => {
-  res.json({
-    success: true,
-    message: 'Access granted to protected resource',
-    user: _req.user
-  });
-});
-
-// Admin-only route example
-app.get('/api/admin', authenticate, (req: Request, res: Response) => {
-  if (req.user?.role !== 'admin') {
-    return res.status(403).json({
-      success: false,
-      message: 'Admin access required'
+// Request logging middleware
+app.use((req, res, next) => {
+    logger.info('Incoming request', {
+        method: req.method,
+        path: req.path,
+        ip: req.ip,
+        userAgent: req.get('user-agent'),
     });
-  }
-  res.json({
-    success: true,
-    message: 'Admin access granted'
-  });
+    next();
 });
 
-// Optional auth route example
-app.get('/api/public', optionalAuth, (req: Request, res: Response) => {
-  res.json({
-    success: true,
-    message: 'Public endpoint',
-    user: req.user || null
-  });
+// Health check endpoint (before routes)
+app.get('/health', (req, res) => {
+    logger.info('Health check endpoint was called', {
+        route: '/health',
+        method: 'GET',
+    });
+    res.status(200).json({
+        status: 'ok',
+        service: 'auth-service',
+        version,
+        environment,
+        timestamp: new Date().toISOString(),
+    });
 });
 
-// 404 handler
-app.use((_req: Request, res: Response) => {
-  res.status(404).json({
-    success: false,
-    message: 'Route not found'
-  });
+// Root endpoint
+app.get('/', (req, res) => {
+    res.json({
+        service: 'Auth Service',
+        version,
+        status: 'running',
+        endpoints: {
+            health: '/health',
+            api: '/v1',
+            docs: '/v1/docs',
+        },
+    });
 });
 
-// Error handler
-app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
-  console.error('Error:', err);
-  res.status(500).json({
-    success: false,
-    message: err.message || 'Internal server error'
-  });
-});
+// ============================================================
+// Server Startup
+// ============================================================
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`🚀 Auth Service running on port ${PORT}`);
-  console.log(`📝 Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`🔐 Health check: http://localhost:${PORT}/health`);
-});
+const buildAuthApp = async (): Promise<void> => {
+    try {
+        logger.info('Building Auth Service...', { environment, port: PORT });
 
-// Graceful shutdown
-const shutdown = async (): Promise<void> => {
-  console.log('Shutting down gracefully...');
-  await UserModel.closeConnections();
-  await closeRedisConnection();
-  process.exit(0);
+        // Initialize DI Container (sets up all dependencies)
+        logger.info('Initializing DI Container...');
+
+        // Get Prisma service to ensure database connection is established
+        const prismaService = diContainer.getPrismaService();
+        await prismaService.client.$connect();
+        logger.info('Database connected successfully');
+
+        // Optional: Check Redis connection
+        const cacheService = diContainer.getCacheService();
+        const redisPing = await cacheService.ping();
+        if (redisPing) {
+            logger.info('Redis connected successfully');
+        } else {
+            logger.warn('Redis connection failed - cache features may be limited');
+        }
+
+        // ============================================================
+        // Mount API Routes AFTER DI Container is ready
+        // ============================================================
+        app.use('/', buildRoutes());
+
+        // Start listening
+        app.listen(PORT, () => {
+            logger.info(`🚀 Auth Service running on port http://localhost:${PORT}`);
+            logger.info(`📚 Environment: ${environment}`);
+            logger.info(`🔧 Health check: http://localhost:${PORT}/health`);
+            logger.info(`🌐 API base: http://localhost:${PORT}/v1`);
+        });
+    } catch (error) {
+        logger.error('Failed to build Auth Service', { error });
+        process.exit(1);
+    }
 };
 
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
+// ============================================================
+// Graceful Shutdown
+// ============================================================
+
+const gracefulShutdown = async (signal: string): Promise<void> => {
+    logger.info(`Received ${signal}. Starting graceful shutdown...`);
+
+    try {
+        // Cleanup DI container resources
+        await diContainer.cleanup();
+
+        logger.info('Graceful shutdown completed');
+        process.exit(0);
+    } catch (error) {
+        logger.error('Error during graceful shutdown', { error });
+        process.exit(1);
+    }
+};
+
+// Handle shutdown signals
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (error) => {
+    logger.error('Uncaught Exception', { error });
+    gracefulShutdown('uncaughtException');
+});
+
+// Handle unhandled promise rejections
+process.on('unhandledRejection', (reason) => {
+    logger.error('Unhandled Rejection', { reason });
+    gracefulShutdown('unhandledRejection');
+});
+
+// ============================================================
+// Start the Application
+// ============================================================
+
+buildAuthApp();
+
+export { app, diContainer };
